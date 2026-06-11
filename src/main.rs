@@ -1,31 +1,64 @@
-#![cfg_attr(feature = "no_console", windows_subsystem = "windows")]
-#![allow(unused_labels)]
-
-use anyhow::{Context};
+#![cfg_attr(
+    all(feature = "no_console", target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde_json::value::Index;
 use serde_json::Value;
 use std::net::TcpStream;
+#[cfg(target_os = "macos")]
+use std::thread;
 use tray_item::{IconSource, TrayItem};
 use tungstenite::http::Uri;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut tray: TrayItem = TrayItem::new(
-        "GAT - GlazeWM Alternating Tiler",
-        IconSource::Resource("main-icon"),
-    )?;
-    tray.add_label("GAT - GlazeWM Alternating Tiler")?;
+const APP_TITLE: &str = "GAT - GlazeWM Alternating Tiler";
+const GLAZEWM_WS_URL: &str = "ws://localhost:6123";
+
+fn main() -> anyhow::Result<()> {
+    run_platform_app()
+}
+
+#[cfg(target_os = "macos")]
+fn run_platform_app() -> anyhow::Result<()> {
+    let mut tray = create_tray(IconSource::Resource(""))?;
+
+    thread::spawn(|| {
+        if let Err(err) = run_glazewm_event_loop() {
+            eprintln!("{err:#}");
+            std::process::exit(1);
+        }
+    });
+
+    tray.inner_mut().display();
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_platform_app() -> anyhow::Result<()> {
+    let _tray = create_tray(IconSource::Resource("main-icon"))?;
+
+    run_glazewm_event_loop()
+}
+
+fn create_tray(icon: IconSource) -> anyhow::Result<TrayItem> {
+    let mut tray = TrayItem::new(APP_TITLE, icon).context("Failed to initialize tray")?;
+    tray.add_label(APP_TITLE)?;
     tray.add_menu_item("Quit GAT", || std::process::exit(0))?;
 
+    Ok(tray)
+}
+
+fn run_glazewm_event_loop() -> anyhow::Result<()> {
     let (mut socket, _) = connect(
-        "ws://localhost:6123"
+        GLAZEWM_WS_URL
             .parse::<Uri>()
             .context("Failed to parse GWM WS URL")?,
     )
-    .context("Failed to connect to GWM WS")?;
+    .context("Failed to connect to GWM WS at ws://localhost:6123")?;
 
     socket
         .send(Message::Text(r#"sub -e focus_changed"#.into()))
@@ -34,11 +67,11 @@ async fn main() -> anyhow::Result<()> {
     socket
         .send(Message::Text(r#"sub -e focused_container_moved"#.into()))
         .context("Failed to subscribe to container moved")?;
-    
+
     socket
         .send(Message::Text(r#"sub -e application_exiting"#.into()))
-        .context("Failed to subscribe to container moved")?;
-    
+        .context("Failed to subscribe to application exiting")?;
+
     loop {
         let event = match read_as::<Value>(&mut socket) {
             Err(e) => {
@@ -49,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let event_type = event.get_path(["data", "eventType"]);
-        
+
         match event_type.and_then(|v| v.as_str()) {
             Some("focused_container_moved") => {
                 _ = handle_focused_container_moved(event, &mut socket).inspect_err(|e| {
@@ -153,7 +186,9 @@ fn change_tiling_direction(
     Ok(())
 }
 
-fn read_as<T: DeserializeOwned>(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> anyhow::Result<Option<T>> {
+fn read_as<T: DeserializeOwned>(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+) -> anyhow::Result<Option<T>> {
     let msg = match socket.read() {
         Ok(msg) => msg,
         Err(err) => {

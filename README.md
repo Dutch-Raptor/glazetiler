@@ -49,21 +49,40 @@ It is a fork of the archived [GAT-GWM](https://github.com/ParasiteDelta/GAT-GWM)
 ### Dependencies
 
 - Rust (Can be installed with [rustup](https://rustup.rs/))
+- GlazeWM running with its IPC WebSocket available at `ws://localhost:6123`
 
 ### Installing with Cargo
 
+On Windows:
+
 ```bash
 cargo install --git https://github.com/Dutch-Raptor/GAT-GWM.git --features=no_console
+```
+
+On macOS:
+
+```bash
+cargo install --git https://github.com/Dutch-Raptor/GAT-GWM.git
 ```
 
 > If ~/.cargo/bin is in your PATH, you can run `gat-gwm` from anywhere.
 
 ### Building from source
 
+On Windows:
+
 ```bash
 git clone https://github.com/glzr-io/gat-gwm
 cd gat-gwm
 cargo build --release --features=no_console
+```
+
+On macOS:
+
+```bash
+git clone https://github.com/glzr-io/gat-gwm
+cd gat-gwm
+cargo build --release
 ```
 
 > The executable will be in `target/release/gat-gwm`.
