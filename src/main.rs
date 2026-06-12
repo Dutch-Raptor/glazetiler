@@ -2,233 +2,267 @@
     all(feature = "no_console", target_os = "windows"),
     windows_subsystem = "windows"
 )]
+
 use anyhow::Context;
-use serde::de::DeserializeOwned;
-use serde_json::value::Index;
-use serde_json::Value;
-use std::net::TcpStream;
-#[cfg(target_os = "macos")]
+use gat_gwm::diagnostics::{
+    append_log_line, ipc_url_text, log_file_path, DiagnosticsState, RuntimeEvent,
+};
+use gat_gwm::runtime::{run_glazewm_event_loop_with_status, ShutdownToken};
 use std::thread;
-use tray_item::{IconSource, TrayItem};
-use tungstenite::http::Uri;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-const APP_TITLE: &str = "GAT - GlazeWM Alternating Tiler";
-const GLAZEWM_WS_URL: &str = "ws://localhost:6123";
-
-fn main() -> anyhow::Result<()> {
-    run_platform_app()
+#[derive(Debug, Clone)]
+enum AppEvent {
+    Runtime(RuntimeEvent),
+    Menu(MenuEvent),
 }
 
-#[cfg(target_os = "macos")]
-fn run_platform_app() -> anyhow::Result<()> {
-    let mut tray = create_tray(IconSource::Resource(""))?;
+fn main() {
+    if let Err(error) = run_app() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
 
-    thread::spawn(|| {
-        if let Err(err) = run_glazewm_event_loop() {
-            eprintln!("{err:#}");
-            std::process::exit(1);
+fn run_app() -> anyhow::Result<()> {
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |event| {
+        _ = menu_proxy.send_event(AppEvent::Menu(event));
+    }));
+
+    let shutdown = ShutdownToken::new();
+    let mut diagnostics = DiagnosticsState::default();
+    let mut tray = None;
+    let mut runtime_started = false;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::NewEvents(StartCause::Init) if tray.is_none() => {
+                match TrayUi::new() {
+                    Ok(ui) => {
+                        tray = Some(ui);
+                        if let Some(tray) = tray.as_ref() {
+                            tray.render(&diagnostics);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to initialize GAT-GWM tray: {error:#}");
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                }
+
+                if !runtime_started {
+                    runtime_started = true;
+                    start_runtime_thread(proxy.clone(), shutdown.clone());
+                }
+            }
+            Event::UserEvent(AppEvent::Runtime(event)) => {
+                if let Err(error) = append_log_line(&event) {
+                    eprintln!("Failed to write GAT-GWM diagnostic log: {error}");
+                }
+
+                diagnostics.apply_event(&event);
+
+                if let Some(tray) = tray.as_ref() {
+                    tray.render(&diagnostics);
+                }
+
+                if matches!(
+                    event,
+                    RuntimeEvent::GlazewmExiting | RuntimeEvent::ShutdownRequested
+                ) {
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(AppEvent::Menu(event)) => {
+                if let Some(tray) = tray.as_ref() {
+                    if tray.is_log_event(event.id()) {
+                        if let Err(error) = open_log_folder() {
+                            eprintln!("Failed to open GAT-GWM log folder: {error:#}");
+                            let event = RuntimeEvent::UiError {
+                                message: format!("Failed to open log folder: {error:#}"),
+                            };
+                            _ = append_log_line(&event);
+                            diagnostics.apply_event(&event);
+                            tray.render(&diagnostics);
+                        }
+                    } else if tray.is_quit_event(event.id()) {
+                        shutdown.request_shutdown();
+                        let event = RuntimeEvent::ShutdownRequested;
+                        _ = append_log_line(&event);
+                        diagnostics.apply_event(&event);
+                        tray.render(&diagnostics);
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+            }
+            _ => {}
         }
     });
+}
 
-    tray.inner_mut().display();
+fn start_runtime_thread(proxy: tao::event_loop::EventLoopProxy<AppEvent>, shutdown: ShutdownToken) {
+    thread::spawn(move || {
+        let event_proxy = proxy.clone();
+        let result = run_glazewm_event_loop_with_status(shutdown, move |status| {
+            _ = event_proxy.send_event(AppEvent::Runtime(status));
+        });
+
+        if let Err(error) = result {
+            _ = proxy.send_event(AppEvent::Runtime(RuntimeEvent::ConnectionError {
+                message: format!("{error:#}"),
+            }));
+        }
+    });
+}
+
+struct TrayUi {
+    _tray_icon: TrayIcon,
+    connection_item: MenuItem,
+    log_id: MenuId,
+    quit_id: MenuId,
+}
+
+impl TrayUi {
+    fn new() -> anyhow::Result<Self> {
+        let menu = Menu::new();
+        let connection_item = MenuItem::new("Connection: starting", false, None);
+        let ipc_item = MenuItem::new(ipc_url_text(), false, None);
+        let log_item = MenuItem::new(format!("Log: {}", log_file_path().display()), true, None);
+        let about_item = MenuItem::new(
+            concat!("About GAT-GWM ", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
+        let log_id = log_item.id().clone();
+        let quit_item = MenuItem::new("Quit GAT-GWM", true, None);
+        let quit_id = quit_item.id().clone();
+
+        menu.append_items(&[
+            &connection_item,
+            &ipc_item,
+            &log_item,
+            &about_item,
+            &quit_item,
+        ])
+        .context("Failed to initialize GAT-GWM tray menu")?;
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_tooltip("GAT-GWM - starting")
+            .with_title("GAT-GWM")
+            .with_icon(app_icon()?)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(true)
+            .with_menu_on_right_click(true)
+            .build()
+            .context("Failed to create GAT-GWM tray icon")?;
+
+        Ok(Self {
+            _tray_icon: tray_icon,
+            connection_item,
+            log_id,
+            quit_id,
+        })
+    }
+
+    fn render(&self, diagnostics: &DiagnosticsState) {
+        let connection_text = diagnostics.connection.menu_text();
+        self.connection_item.set_text(&connection_text);
+        _ = self
+            ._tray_icon
+            .set_tooltip(Some(diagnostics.connection.tooltip_text()));
+
+        #[cfg(target_os = "macos")]
+        {
+            _ = self._tray_icon.set_title(Some(connection_text));
+        }
+    }
+
+    fn is_quit_event(&self, id: &MenuId) -> bool {
+        id == &self.quit_id
+    }
+
+    fn is_log_event(&self, id: &MenuId) -> bool {
+        id == &self.log_id
+    }
+}
+
+fn open_log_folder() -> anyhow::Result<()> {
+    let log_path = log_file_path();
+    let log_folder = log_path
+        .parent()
+        .context("GAT-GWM log path did not include a containing folder")?;
+
+    std::fs::create_dir_all(log_folder).with_context(|| {
+        format!(
+            "Failed to create GAT-GWM log folder at {}",
+            log_folder.display()
+        )
+    })?;
+
+    open_folder(log_folder)
+}
+
+#[cfg(target_os = "windows")]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch Windows Explorer for GAT-GWM log folder")?;
 
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn run_platform_app() -> anyhow::Result<()> {
-    let _tray = create_tray(IconSource::Resource("main-icon"))?;
-
-    run_glazewm_event_loop()
-}
-
-fn create_tray(icon: IconSource) -> anyhow::Result<TrayItem> {
-    let mut tray = TrayItem::new(APP_TITLE, icon).context("Failed to initialize tray")?;
-    tray.add_label(APP_TITLE)?;
-    tray.add_menu_item("Quit GAT", || std::process::exit(0))?;
-
-    Ok(tray)
-}
-
-fn run_glazewm_event_loop() -> anyhow::Result<()> {
-    let (mut socket, _) = connect(
-        GLAZEWM_WS_URL
-            .parse::<Uri>()
-            .context("Failed to parse GWM WS URL")?,
-    )
-    .context("Failed to connect to GWM WS at ws://localhost:6123")?;
-
-    socket
-        .send(Message::Text(r#"sub -e focus_changed"#.into()))
-        .context("Failed to subscribe to focus_changed event")?;
-
-    socket
-        .send(Message::Text(r#"sub -e focused_container_moved"#.into()))
-        .context("Failed to subscribe to container moved")?;
-
-    socket
-        .send(Message::Text(r#"sub -e application_exiting"#.into()))
-        .context("Failed to subscribe to application exiting")?;
-
-    loop {
-        let event = match read_as::<Value>(&mut socket) {
-            Err(e) => {
-                return Err(e);
-            }
-            Ok(Some(value)) => value,
-            Ok(None) => continue,
-        };
-
-        let event_type = event.get_path(["data", "eventType"]);
-
-        match event_type.and_then(|v| v.as_str()) {
-            Some("focused_container_moved") => {
-                _ = handle_focused_container_moved(event, &mut socket).inspect_err(|e| {
-                    eprintln!("Failed to handle focused container moved event: {e}")
-                });
-            }
-            Some("focus_changed") => {
-                _ = handle_focus_changed(event, &mut socket)
-                    .inspect_err(|e| eprintln!("Failed to handle focus changed event: {e}"))
-            }
-            Some("application_exiting") => {
-                eprintln!("GlazeWM is exiting, exiting too.");
-                std::process::exit(0);
-            }
-            _ => continue,
-        }
-    }
-}
-
-fn handle_focused_container_moved(
-    event: Value,
-    web_socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<()> {
-    let root_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focused container event to contain a focused container field")?;
-
-    fn find_focused_window(container: &Value) -> Option<&Value> {
-        let container_type = container.get_path(["type"]).and_then(|v| v.as_str())?;
-        let has_focus = container.get_path(["hasFocus"]).and_then(|v| v.as_bool())?;
-
-        // Termination case: focused window found
-        if container_type == "window" && has_focus {
-            return Some(container);
-        }
-
-        let children = container.get("children").and_then(|v| v.as_array())?;
-
-        // Recursive case: search through children
-        for child in children {
-            if let Some(focused_container) = find_focused_window(child) {
-                return Some(focused_container);
-            }
-        }
-
-        // Termination case: No window with focus
-        None
-    }
-
-    if let Some(focused_window) = find_focused_window(root_container) {
-        let (width, height) = get_container_size(&focused_window)
-            .context("focused container did not have a width or height")?;
-        change_tiling_direction(web_socket, width, height)?;
-    }
+#[cfg(target_os = "macos")]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch Finder for GAT-GWM log folder")?;
 
     Ok(())
 }
 
-fn handle_focus_changed(
-    event: Value,
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<()> {
-    let focused_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focus changed event to contain a focused container field")?;
-    let (width, height) = get_container_size(focused_container)
-        .context("focused container did not have a width or height")?;
-
-    change_tiling_direction(socket, width, height)?;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch a file manager for GAT-GWM log folder")?;
 
     Ok(())
 }
 
-fn get_container_size(event: &Value) -> Option<(f64, f64)> {
-    let width = event.get("width").and_then(|v| v.as_f64())?;
-    let height = event.get("height").and_then(|v| v.as_f64())?;
+fn app_icon() -> anyhow::Result<Icon> {
+    const SIZE: u32 = 32;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
 
-    Some((width, height))
-}
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let in_frame = !(4..=27).contains(&x) || !(4..=27).contains(&y);
+            let in_split = (14..=17).contains(&x) || (14..=17).contains(&y);
+            let accent = x > 17 && y > 17;
+            let (r, g, b, a) = if in_frame {
+                (22, 25, 32, 255)
+            } else if in_split {
+                (245, 247, 250, 255)
+            } else if accent {
+                (43, 132, 210, 255)
+            } else {
+                (72, 80, 94, 255)
+            };
 
-fn change_tiling_direction(
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    window_width: f64,
-    window_height: f64,
-) -> anyhow::Result<()> {
-    if window_width < window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction vertical".into(),
-            ))
-            .context("Failed to send message to GWM")?;
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
     }
-    if window_width > window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction horizontal".into(),
-            ))
-            .context("Failed to send message to GWM")?;
-    };
 
-    Ok(())
-}
-
-fn read_as<T: DeserializeOwned>(
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<Option<T>> {
-    let msg = match socket.read() {
-        Ok(msg) => msg,
-        Err(err) => {
-            return Err(err).context("Failed to read message from GWM socket");
-        }
-    };
-
-    let text = match msg.to_text() {
-        Ok(text) => text,
-        Err(err) => {
-            eprintln!("Error while converting message to text: {err}");
-            return Ok(None);
-        }
-    };
-
-    let json_msg = match serde_json::from_str(text) {
-        Ok(msg) => msg,
-        Err(err) => {
-            eprintln!("Error while parsing message as json: {err}");
-            return Ok(None);
-        }
-    };
-
-    Ok(Some(json_msg))
-}
-
-trait JsonValueExt {
-    /// Retrieves a nested value based on the provided path of keys.
-    ///
-    /// # Arguments
-    /// * `path` - An iterable of string keys specifying the nested path.
-    ///
-    /// # Returns
-    /// * `Option<&Value>` - The nested value if found, otherwise `None`.
-    fn get_path<T: IntoIterator<Item = I>, I: Index>(&self, path: T) -> Option<&Value>;
-}
-
-impl JsonValueExt for Value {
-    fn get_path<T: IntoIterator<Item = I>, I: Index>(&self, path: T) -> Option<&Value> {
-        path.into_iter()
-            .fold(Some(self), |acc, key| acc.and_then(|v| v.get(key)))
-    }
+    Icon::from_rgba(rgba, SIZE, SIZE).context("Failed to create GAT-GWM tray icon image")
 }

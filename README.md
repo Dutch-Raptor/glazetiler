@@ -106,3 +106,16 @@ cargo build --release
 
 - Does not support resizing of windows. I am not aware of a way to get notified when a window is resized by GlazeWM.
   As a workaround, you can refocus the window after it has been resized or manually set the tiling direction.
+
+## Diagnostics
+
+GAT-GWM runs as a tray application and shows live diagnostic state in its tray menu:
+
+- Current connection state
+- GlazeWM IPC URL
+- Diagnostic log path
+
+Tiling direction changes and ignored IPC messages are written to the diagnostic log instead of the tray menu.
+
+On Windows, the diagnostic log is written to `%APPDATA%\GAT-GWM\gat-gwm.log`.
+On macOS, it is written to `~/Library/Application Support/GAT-GWM/gat-gwm.log`.
