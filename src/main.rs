@@ -1,17 +1,15 @@
-#![cfg_attr(
-    all(feature = "no_console", target_os = "windows"),
-    windows_subsystem = "windows"
-)]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use anyhow::Context;
-use gat_gwm::diagnostics::{
-    append_log_line, ipc_url_text, log_file_path, DiagnosticsState, RuntimeEvent,
+use glazetiler::diagnostics::{
+    ipc_url_text, log_dir, log_file_pattern, DiagnosticsState, RuntimeEvent,
 };
-use gat_gwm::runtime::{run_glazewm_event_loop_with_status, ShutdownToken};
+use glazetiler::logging::init_file_logging;
+use glazetiler::runtime::{run_glazewm_event_loop_with_status, ShutdownToken};
 use std::thread;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Debug, Clone)]
@@ -28,6 +26,9 @@ fn main() {
 }
 
 fn run_app() -> anyhow::Result<()> {
+    let _log_guard = init_file_logging()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Starting GlazeTiler");
+
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
@@ -53,7 +54,7 @@ fn run_app() -> anyhow::Result<()> {
                         }
                     }
                     Err(error) => {
-                        eprintln!("Failed to initialize GAT-GWM tray: {error:#}");
+                        tracing::error!(error = %format!("{error:#}"), "Failed to initialize GlazeTiler tray");
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -65,10 +66,7 @@ fn run_app() -> anyhow::Result<()> {
                 }
             }
             Event::UserEvent(AppEvent::Runtime(event)) => {
-                if let Err(error) = append_log_line(&event) {
-                    eprintln!("Failed to write GAT-GWM diagnostic log: {error}");
-                }
-
+                log_runtime_event(&event);
                 diagnostics.apply_event(&event);
 
                 if let Some(tray) = tray.as_ref() {
@@ -86,18 +84,18 @@ fn run_app() -> anyhow::Result<()> {
                 if let Some(tray) = tray.as_ref() {
                     if tray.is_log_event(event.id()) {
                         if let Err(error) = open_log_folder() {
-                            eprintln!("Failed to open GAT-GWM log folder: {error:#}");
+                            tracing::error!(error = %format!("{error:#}"), "Failed to open GlazeTiler log folder");
                             let event = RuntimeEvent::UiError {
                                 message: format!("Failed to open log folder: {error:#}"),
                             };
-                            _ = append_log_line(&event);
+                            log_runtime_event(&event);
                             diagnostics.apply_event(&event);
                             tray.render(&diagnostics);
                         }
                     } else if tray.is_quit_event(event.id()) {
                         shutdown.request_shutdown();
                         let event = RuntimeEvent::ShutdownRequested;
-                        _ = append_log_line(&event);
+                        log_runtime_event(&event);
                         diagnostics.apply_event(&event);
                         tray.render(&diagnostics);
                         *control_flow = ControlFlow::Exit;
@@ -107,6 +105,30 @@ fn run_app() -> anyhow::Result<()> {
             _ => {}
         }
     });
+}
+
+fn log_runtime_event(event: &RuntimeEvent) {
+    match event {
+        RuntimeEvent::ConnectionError { message } | RuntimeEvent::UiError { message } => {
+            tracing::error!(message = %message, "{event}");
+        }
+        RuntimeEvent::IgnoredMessage { reason } => {
+            tracing::warn!(reason = %reason, "{event}");
+        }
+        RuntimeEvent::Reconnecting { delay_seconds } => {
+            tracing::warn!(delay_seconds = *delay_seconds, "{event}");
+        }
+        RuntimeEvent::DirectionChanged { direction } => {
+            tracing::info!(direction = direction.as_str(), "{event}");
+        }
+        RuntimeEvent::Starting
+        | RuntimeEvent::Connecting
+        | RuntimeEvent::Connected
+        | RuntimeEvent::GlazewmExiting
+        | RuntimeEvent::ShutdownRequested => {
+            tracing::info!("{event}");
+        }
+    }
 }
 
 fn start_runtime_thread(proxy: tao::event_loop::EventLoopProxy<AppEvent>, shutdown: ShutdownToken) {
@@ -136,34 +158,51 @@ impl TrayUi {
         let menu = Menu::new();
         let connection_item = MenuItem::new("Connection: starting", false, None);
         let ipc_item = MenuItem::new(ipc_url_text(), false, None);
-        let log_item = MenuItem::new(format!("Log: {}", log_file_path().display()), true, None);
-        let about_item = MenuItem::new(
-            concat!("About GAT-GWM ", env!("CARGO_PKG_VERSION")),
+        let log_path_item = MenuItem::new(
+            format!("Log: {}", log_file_pattern().display()),
             false,
             None,
         );
+        let log_item = MenuItem::new("Open Log Folder", true, None);
+        let diagnostics_separator = PredefinedMenuItem::separator();
+        let diagnostics_menu = Submenu::with_items(
+            "Diagnostics",
+            true,
+            &[&ipc_item, &log_path_item, &diagnostics_separator, &log_item],
+        )
+        .context("Failed to initialize GlazeTiler diagnostics tray submenu")?;
+        let about_item = MenuItem::new(
+            concat!("About GlazeTiler ", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
+        let app_menu = Submenu::with_items("App", true, &[&about_item])
+            .context("Failed to initialize GlazeTiler app tray submenu")?;
+        let status_separator = PredefinedMenuItem::separator();
+        let quit_separator = PredefinedMenuItem::separator();
         let log_id = log_item.id().clone();
-        let quit_item = MenuItem::new("Quit GAT-GWM", true, None);
+        let quit_item = MenuItem::new("Quit GlazeTiler", true, None);
         let quit_id = quit_item.id().clone();
 
         menu.append_items(&[
             &connection_item,
-            &ipc_item,
-            &log_item,
-            &about_item,
+            &status_separator,
+            &diagnostics_menu,
+            &app_menu,
+            &quit_separator,
             &quit_item,
         ])
-        .context("Failed to initialize GAT-GWM tray menu")?;
+        .context("Failed to initialize GlazeTiler tray menu")?;
 
         let tray_icon = TrayIconBuilder::new()
-            .with_tooltip("GAT-GWM - starting")
-            .with_title("GAT-GWM")
+            .with_tooltip("GlazeTiler - starting")
+            .with_title("GlazeTiler")
             .with_icon(app_icon()?)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(true)
             .with_menu_on_right_click(true)
             .build()
-            .context("Failed to create GAT-GWM tray icon")?;
+            .context("Failed to create GlazeTiler tray icon")?;
 
         Ok(Self {
             _tray_icon: tray_icon,
@@ -182,7 +221,7 @@ impl TrayUi {
 
         #[cfg(target_os = "macos")]
         {
-            _ = self._tray_icon.set_title(Some(connection_text));
+            self._tray_icon.set_title(Some(connection_text));
         }
     }
 
@@ -196,19 +235,16 @@ impl TrayUi {
 }
 
 fn open_log_folder() -> anyhow::Result<()> {
-    let log_path = log_file_path();
-    let log_folder = log_path
-        .parent()
-        .context("GAT-GWM log path did not include a containing folder")?;
+    let log_folder = log_dir();
 
-    std::fs::create_dir_all(log_folder).with_context(|| {
+    std::fs::create_dir_all(&log_folder).with_context(|| {
         format!(
-            "Failed to create GAT-GWM log folder at {}",
+            "Failed to create GlazeTiler log folder at {}",
             log_folder.display()
         )
     })?;
 
-    open_folder(log_folder)
+    open_folder(&log_folder)
 }
 
 #[cfg(target_os = "windows")]
@@ -216,7 +252,7 @@ fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
     std::process::Command::new("explorer")
         .arg(path)
         .spawn()
-        .context("Failed to launch Windows Explorer for GAT-GWM log folder")?;
+        .context("Failed to launch Windows Explorer for GlazeTiler log folder")?;
 
     Ok(())
 }
@@ -226,7 +262,7 @@ fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
     std::process::Command::new("open")
         .arg(path)
         .spawn()
-        .context("Failed to launch Finder for GAT-GWM log folder")?;
+        .context("Failed to launch Finder for GlazeTiler log folder")?;
 
     Ok(())
 }
@@ -236,7 +272,7 @@ fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
     std::process::Command::new("xdg-open")
         .arg(path)
         .spawn()
-        .context("Failed to launch a file manager for GAT-GWM log folder")?;
+        .context("Failed to launch a file manager for GlazeTiler log folder")?;
 
     Ok(())
 }
@@ -264,5 +300,5 @@ fn app_icon() -> anyhow::Result<Icon> {
         }
     }
 
-    Icon::from_rgba(rgba, SIZE, SIZE).context("Failed to create GAT-GWM tray icon image")
+    Icon::from_rgba(rgba, SIZE, SIZE).context("Failed to create GlazeTiler tray icon image")
 }

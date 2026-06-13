@@ -108,7 +108,6 @@ where
                         event_sink.publish(RuntimeEvent::ConnectionError {
                             message: format!("{error:#}"),
                         });
-                        eprintln!("GlazeWM IPC connection lost: {error:#}");
                     }
                 }
             }
@@ -116,7 +115,6 @@ where
                 event_sink.publish(RuntimeEvent::ConnectionError {
                     message: format!("{error:#}"),
                 });
-                eprintln!("Failed to connect to GlazeWM IPC at {GLAZEWM_WS_URL}: {error:#}");
             }
         }
 
@@ -125,10 +123,6 @@ where
         event_sink.publish(RuntimeEvent::Reconnecting {
             delay_seconds: delay.as_secs(),
         });
-        eprintln!(
-            "Retrying GlazeWM IPC connection in {} second(s).",
-            delay.as_secs()
-        );
         sleeper.sleep(delay);
     }
 
@@ -196,14 +190,12 @@ fn handle_message(
             event_sink.publish(RuntimeEvent::IgnoredMessage {
                 reason: error.to_string(),
             });
-            eprintln!("Ignoring malformed GlazeWM IPC message: {error}");
             return Ok(MessageOutcome::Continue);
         }
     };
 
     if event == GlazeEvent::ApplicationExiting {
         event_sink.publish(RuntimeEvent::GlazewmExiting);
-        eprintln!("GlazeWM is exiting; GAT-GWM is exiting too.");
         return Ok(MessageOutcome::ApplicationExiting);
     }
 

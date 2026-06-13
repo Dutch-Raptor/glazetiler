@@ -2,10 +2,7 @@ use crate::tiling::TilingDirection;
 use crate::GLAZEWM_WS_URL;
 use std::env;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -49,7 +46,7 @@ impl ConnectionState {
 
     pub fn tooltip_text(&self) -> String {
         format!(
-            "GAT-GWM - {}",
+            "GlazeTiler - {}",
             self.menu_text().replacen("Connection: ", "", 1)
         )
     }
@@ -148,44 +145,34 @@ where
     }
 }
 
-pub fn log_file_path() -> PathBuf {
-    app_data_dir().join("gat-gwm.log")
+pub const LOG_FILE_PREFIX: &str = "glazetiler.log";
+pub const LOG_RETENTION_DAYS: usize = 14;
+
+pub fn log_dir() -> PathBuf {
+    app_data_dir()
 }
 
-pub fn append_log_line(event: &RuntimeEvent) -> io::Result<()> {
-    let path = log_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{} {}", timestamp_seconds(), event)
+pub fn log_file_pattern() -> PathBuf {
+    log_dir().join(format!("{LOG_FILE_PREFIX}.YYYY-MM-DD"))
 }
 
 pub fn ipc_url_text() -> String {
     format!("IPC: {GLAZEWM_WS_URL}")
 }
 
-fn app_data_dir() -> PathBuf {
+pub fn app_data_dir() -> PathBuf {
     if let Ok(app_data) = env::var("APPDATA") {
-        return PathBuf::from(app_data).join("GAT-GWM");
+        return PathBuf::from(app_data).join("GlazeTiler");
     }
 
     if let Ok(home) = env::var("HOME") {
         return PathBuf::from(home)
             .join("Library")
             .join("Application Support")
-            .join("GAT-GWM");
+            .join("GlazeTiler");
     }
 
-    env::temp_dir().join("GAT-GWM")
-}
-
-fn timestamp_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    env::temp_dir().join("GlazeTiler")
 }
 
 fn one_line(value: &str) -> String {
@@ -230,7 +217,7 @@ mod tests {
         );
         assert_eq!(
             ConnectionState::Connected.tooltip_text(),
-            "GAT-GWM - connected".to_string()
+            "GlazeTiler - connected".to_string()
         );
     }
 
