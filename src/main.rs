@@ -1,199 +1,304 @@
-#![cfg_attr(feature = "no_console", windows_subsystem = "windows")]
-#![allow(unused_labels)]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use anyhow::{Context};
-use serde::de::DeserializeOwned;
-use serde_json::value::Index;
-use serde_json::Value;
-use std::net::TcpStream;
-use tray_item::{IconSource, TrayItem};
-use tungstenite::http::Uri;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use anyhow::Context;
+use glazetiler::diagnostics::{
+    ipc_url_text, log_dir, log_file_pattern, DiagnosticsState, RuntimeEvent,
+};
+use glazetiler::logging::init_file_logging;
+use glazetiler::runtime::{run_glazewm_event_loop_with_status, ShutdownToken};
+use std::thread;
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut tray: TrayItem = TrayItem::new(
-        "GAT - GlazeWM Alternating Tiler",
-        IconSource::Resource("main-icon"),
-    )?;
-    tray.add_label("GAT - GlazeWM Alternating Tiler")?;
-    tray.add_menu_item("Quit GAT", || std::process::exit(0))?;
+#[derive(Debug, Clone)]
+enum AppEvent {
+    Runtime(RuntimeEvent),
+    Menu(MenuEvent),
+}
 
-    let (mut socket, _) = connect(
-        "ws://localhost:6123"
-            .parse::<Uri>()
-            .context("Failed to parse GWM WS URL")?,
-    )
-    .context("Failed to connect to GWM WS")?;
+fn main() {
+    if let Err(error) = run_app() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
 
-    socket
-        .send(Message::Text(r#"sub -e focus_changed"#.into()))
-        .context("Failed to subscribe to focus_changed event")?;
+fn run_app() -> anyhow::Result<()> {
+    let _log_guard = init_file_logging()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Starting GlazeTiler");
 
-    socket
-        .send(Message::Text(r#"sub -e focused_container_moved"#.into()))
-        .context("Failed to subscribe to container moved")?;
-    
-    socket
-        .send(Message::Text(r#"sub -e application_exiting"#.into()))
-        .context("Failed to subscribe to container moved")?;
-    
-    loop {
-        let event = match read_as::<Value>(&mut socket) {
-            Err(e) => {
-                return Err(e);
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |event| {
+        _ = menu_proxy.send_event(AppEvent::Menu(event));
+    }));
+
+    let shutdown = ShutdownToken::new();
+    let mut diagnostics = DiagnosticsState::default();
+    let mut tray = None;
+    let mut runtime_started = false;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::NewEvents(StartCause::Init) if tray.is_none() => {
+                match TrayUi::new() {
+                    Ok(ui) => {
+                        tray = Some(ui);
+                        if let Some(tray) = tray.as_ref() {
+                            tray.render(&diagnostics);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %format!("{error:#}"), "Failed to initialize GlazeTiler tray");
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                }
+
+                if !runtime_started {
+                    runtime_started = true;
+                    start_runtime_thread(proxy.clone(), shutdown.clone());
+                }
             }
-            Ok(Some(value)) => value,
-            Ok(None) => continue,
-        };
+            Event::UserEvent(AppEvent::Runtime(event)) => {
+                log_runtime_event(&event);
+                diagnostics.apply_event(&event);
 
-        let event_type = event.get_path(["data", "eventType"]);
-        
-        match event_type.and_then(|v| v.as_str()) {
-            Some("focused_container_moved") => {
-                _ = handle_focused_container_moved(event, &mut socket).inspect_err(|e| {
-                    eprintln!("Failed to handle focused container moved event: {e}")
-                });
+                if let Some(tray) = tray.as_ref() {
+                    tray.render(&diagnostics);
+                }
+
+                if matches!(
+                    event,
+                    RuntimeEvent::GlazewmExiting | RuntimeEvent::ShutdownRequested
+                ) {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
-            Some("focus_changed") => {
-                _ = handle_focus_changed(event, &mut socket)
-                    .inspect_err(|e| eprintln!("Failed to handle focus changed event: {e}"))
+            Event::UserEvent(AppEvent::Menu(event)) => {
+                if let Some(tray) = tray.as_ref() {
+                    if tray.is_log_event(event.id()) {
+                        if let Err(error) = open_log_folder() {
+                            tracing::error!(error = %format!("{error:#}"), "Failed to open GlazeTiler log folder");
+                            let event = RuntimeEvent::UiError {
+                                message: format!("Failed to open log folder: {error:#}"),
+                            };
+                            log_runtime_event(&event);
+                            diagnostics.apply_event(&event);
+                            tray.render(&diagnostics);
+                        }
+                    } else if tray.is_quit_event(event.id()) {
+                        shutdown.request_shutdown();
+                        let event = RuntimeEvent::ShutdownRequested;
+                        log_runtime_event(&event);
+                        diagnostics.apply_event(&event);
+                        tray.render(&diagnostics);
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
             }
-            Some("application_exiting") => {
-                eprintln!("GlazeWM is exiting, exiting too.");
-                std::process::exit(0);
-            }
-            _ => continue,
+            _ => {}
+        }
+    });
+}
+
+fn log_runtime_event(event: &RuntimeEvent) {
+    match event {
+        RuntimeEvent::ConnectionError { message } | RuntimeEvent::UiError { message } => {
+            tracing::error!(message = %message, "{event}");
+        }
+        RuntimeEvent::IgnoredMessage { reason } => {
+            tracing::warn!(reason = %reason, "{event}");
+        }
+        RuntimeEvent::Reconnecting { delay_seconds } => {
+            tracing::warn!(delay_seconds = *delay_seconds, "{event}");
+        }
+        RuntimeEvent::DirectionChanged { direction } => {
+            tracing::info!(direction = direction.as_str(), "{event}");
+        }
+        RuntimeEvent::Starting
+        | RuntimeEvent::Connecting
+        | RuntimeEvent::Connected
+        | RuntimeEvent::GlazewmExiting
+        | RuntimeEvent::ShutdownRequested => {
+            tracing::info!("{event}");
         }
     }
 }
 
-fn handle_focused_container_moved(
-    event: Value,
-    web_socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<()> {
-    let root_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focused container event to contain a focused container field")?;
+fn start_runtime_thread(proxy: tao::event_loop::EventLoopProxy<AppEvent>, shutdown: ShutdownToken) {
+    thread::spawn(move || {
+        let event_proxy = proxy.clone();
+        let result = run_glazewm_event_loop_with_status(shutdown, move |status| {
+            _ = event_proxy.send_event(AppEvent::Runtime(status));
+        });
 
-    fn find_focused_window(container: &Value) -> Option<&Value> {
-        let container_type = container.get_path(["type"]).and_then(|v| v.as_str())?;
-        let has_focus = container.get_path(["hasFocus"]).and_then(|v| v.as_bool())?;
-
-        // Termination case: focused window found
-        if container_type == "window" && has_focus {
-            return Some(container);
+        if let Err(error) = result {
+            _ = proxy.send_event(AppEvent::Runtime(RuntimeEvent::ConnectionError {
+                message: format!("{error:#}"),
+            }));
         }
+    });
+}
 
-        let children = container.get("children").and_then(|v| v.as_array())?;
+struct TrayUi {
+    _tray_icon: TrayIcon,
+    connection_item: MenuItem,
+    log_id: MenuId,
+    quit_id: MenuId,
+}
 
-        // Recursive case: search through children
-        for child in children {
-            if let Some(focused_container) = find_focused_window(child) {
-                return Some(focused_container);
-            }
-        }
+impl TrayUi {
+    fn new() -> anyhow::Result<Self> {
+        let menu = Menu::new();
+        let connection_item = MenuItem::new("Connection: starting", false, None);
+        let ipc_item = MenuItem::new(ipc_url_text(), false, None);
+        let log_path_item = MenuItem::new(
+            format!("Log: {}", log_file_pattern().display()),
+            false,
+            None,
+        );
+        let log_item = MenuItem::new("Open Log Folder", true, None);
+        let diagnostics_separator = PredefinedMenuItem::separator();
+        let diagnostics_menu = Submenu::with_items(
+            "Diagnostics",
+            true,
+            &[&ipc_item, &log_path_item, &diagnostics_separator, &log_item],
+        )
+        .context("Failed to initialize GlazeTiler diagnostics tray submenu")?;
+        let about_item = MenuItem::new(
+            concat!("About GlazeTiler ", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
+        let app_menu = Submenu::with_items("App", true, &[&about_item])
+            .context("Failed to initialize GlazeTiler app tray submenu")?;
+        let status_separator = PredefinedMenuItem::separator();
+        let quit_separator = PredefinedMenuItem::separator();
+        let log_id = log_item.id().clone();
+        let quit_item = MenuItem::new("Quit GlazeTiler", true, None);
+        let quit_id = quit_item.id().clone();
 
-        // Termination case: No window with focus
-        None
+        menu.append_items(&[
+            &connection_item,
+            &status_separator,
+            &diagnostics_menu,
+            &app_menu,
+            &quit_separator,
+            &quit_item,
+        ])
+        .context("Failed to initialize GlazeTiler tray menu")?;
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_tooltip("GlazeTiler - starting")
+            .with_title("GlazeTiler")
+            .with_icon(app_icon()?)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(true)
+            .with_menu_on_right_click(true)
+            .build()
+            .context("Failed to create GlazeTiler tray icon")?;
+
+        Ok(Self {
+            _tray_icon: tray_icon,
+            connection_item,
+            log_id,
+            quit_id,
+        })
     }
 
-    if let Some(focused_window) = find_focused_window(root_container) {
-        let (width, height) = get_container_size(&focused_window)
-            .context("focused container did not have a width or height")?;
-        change_tiling_direction(web_socket, width, height)?;
+    fn render(&self, diagnostics: &DiagnosticsState) {
+        let connection_text = diagnostics.connection.menu_text();
+        self.connection_item.set_text(&connection_text);
+        _ = self
+            ._tray_icon
+            .set_tooltip(Some(diagnostics.connection.tooltip_text()));
+
+        #[cfg(target_os = "macos")]
+        {
+            self._tray_icon.set_title(Some(connection_text));
+        }
     }
+
+    fn is_quit_event(&self, id: &MenuId) -> bool {
+        id == &self.quit_id
+    }
+
+    fn is_log_event(&self, id: &MenuId) -> bool {
+        id == &self.log_id
+    }
+}
+
+fn open_log_folder() -> anyhow::Result<()> {
+    let log_folder = log_dir();
+
+    std::fs::create_dir_all(&log_folder).with_context(|| {
+        format!(
+            "Failed to create GlazeTiler log folder at {}",
+            log_folder.display()
+        )
+    })?;
+
+    open_folder(&log_folder)
+}
+
+#[cfg(target_os = "windows")]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch Windows Explorer for GlazeTiler log folder")?;
 
     Ok(())
 }
 
-fn handle_focus_changed(
-    event: Value,
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<()> {
-    let focused_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focus changed event to contain a focused container field")?;
-    let (width, height) = get_container_size(focused_container)
-        .context("focused container did not have a width or height")?;
-
-    change_tiling_direction(socket, width, height)?;
+#[cfg(target_os = "macos")]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch Finder for GlazeTiler log folder")?;
 
     Ok(())
 }
 
-fn get_container_size(event: &Value) -> Option<(f64, f64)> {
-    let width = event.get("width").and_then(|v| v.as_f64())?;
-    let height = event.get("height").and_then(|v| v.as_f64())?;
-
-    Some((width, height))
-}
-
-fn change_tiling_direction(
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    window_width: f64,
-    window_height: f64,
-) -> anyhow::Result<()> {
-    if window_width < window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction vertical".into(),
-            ))
-            .context("Failed to send message to GWM")?;
-    }
-    if window_width > window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction horizontal".into(),
-            ))
-            .context("Failed to send message to GWM")?;
-    };
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn open_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .context("Failed to launch a file manager for GlazeTiler log folder")?;
 
     Ok(())
 }
 
-fn read_as<T: DeserializeOwned>(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> anyhow::Result<Option<T>> {
-    let msg = match socket.read() {
-        Ok(msg) => msg,
-        Err(err) => {
-            return Err(err).context("Failed to read message from GWM socket");
+fn app_icon() -> anyhow::Result<Icon> {
+    const SIZE: u32 = 32;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let in_frame = !(4..=27).contains(&x) || !(4..=27).contains(&y);
+            let in_split = (14..=17).contains(&x) || (14..=17).contains(&y);
+            let accent = x > 17 && y > 17;
+            let (r, g, b, a) = if in_frame {
+                (22, 25, 32, 255)
+            } else if in_split {
+                (245, 247, 250, 255)
+            } else if accent {
+                (43, 132, 210, 255)
+            } else {
+                (72, 80, 94, 255)
+            };
+
+            rgba.extend_from_slice(&[r, g, b, a]);
         }
-    };
-
-    let text = match msg.to_text() {
-        Ok(text) => text,
-        Err(err) => {
-            eprintln!("Error while converting message to text: {err}");
-            return Ok(None);
-        }
-    };
-
-    let json_msg = match serde_json::from_str(text) {
-        Ok(msg) => msg,
-        Err(err) => {
-            eprintln!("Error while parsing message as json: {err}");
-            return Ok(None);
-        }
-    };
-
-    Ok(Some(json_msg))
-}
-
-trait JsonValueExt {
-    /// Retrieves a nested value based on the provided path of keys.
-    ///
-    /// # Arguments
-    /// * `path` - An iterable of string keys specifying the nested path.
-    ///
-    /// # Returns
-    /// * `Option<&Value>` - The nested value if found, otherwise `None`.
-    fn get_path<T: IntoIterator<Item = I>, I: Index>(&self, path: T) -> Option<&Value>;
-}
-
-impl JsonValueExt for Value {
-    fn get_path<T: IntoIterator<Item = I>, I: Index>(&self, path: T) -> Option<&Value> {
-        path.into_iter()
-            .fold(Some(self), |acc, key| acc.and_then(|v| v.get(key)))
     }
+
+    Icon::from_rgba(rgba, SIZE, SIZE).context("Failed to create GlazeTiler tray icon image")
 }
